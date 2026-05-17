@@ -1,340 +1,435 @@
-package com.example.nihongolens
+package com.captionlens.app;
 
-import android.Manifest
-import android.app.Activity
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.provider.Settings
-import android.util.Log
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import io.flutter.embedding.android.FlutterActivity
-import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
+import android.app.*;
+import android.content.*;
+import android.graphics.*;
+import android.media.*;
+import android.media.projection.*;
+import android.net.*;
+import android.os.*;
+import android.provider.*;
+import android.view.*;
+import android.widget.*;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import org.json.*;
+
+import java.io.*;
+import java.net.*;
+import java.util.concurrent.*;
 
 /**
- * MainActivity
+ * MainActivity — Caption Lens (Whisper + LibreTranslate edition)
  *
- * KEY FIX — crash on "Start Capture":
- *   The original code called requestMediaProjection() inside onRequestPermissionsResult(),
- *   which started a NEW Activity result before the old one finished, leaving
- *   pendingProjectionResult in an inconsistent state that crashed on API 34.
- *
- *   Fix: separate request codes, guard every result dispatch with a null check,
- *   and ensure we NEVER deliver two MethodChannel results from one call.
+ * Changes vs Vosk version:
+ *  • Vosk entirely removed — no 1.8 GB model, no heavy background decoder
+ *  • Audio captured internally (MediaProjection) in 3-second chunks
+ *  • Chunks sent to whisper_server.py (localhost:8765) for transcription
+ *  • Detected language auto-translated to Hindi via LibreTranslate (localhost:5000)
+ *  • Overlay subtitle is full-width, left-aligned, plain text, no box/frame
+ *  • Aggressive chunk sizing keeps CPU usage low on Dimensity 7050
  */
-class MainActivity : FlutterActivity() {
+public class MainActivity extends AppCompatActivity {
 
-    companion object {
-        @Volatile var instance: MainActivity? = null
+    // ── Constants ────────────────────────────────────────────────────────────
+    private static final int REQ_MEDIA_PROJECTION = 1001;
+    private static final int REQ_OVERLAY          = 1002;
 
-        private const val REQ_MEDIA_PROJECTION = 200
-        private const val REQ_AUDIO_PERMISSION  = 100
-        private const val TAG                   = "MainActivity"
+    private static final String WHISPER_URL      = "http://127.0.0.1:8765/transcribe";
+    private static final String LIBRE_URL        = "http://127.0.0.1:5000/translate";
+
+    // Audio capture parameters — 16 kHz mono 16-bit (Whisper native format)
+    private static final int SAMPLE_RATE    = 16000;
+    private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO;
+    private static final int AUDIO_FORMAT   = AudioFormat.ENCODING_PCM_16BIT;
+    // 3-second chunks — good balance of latency vs CPU on Dimensity 7050
+    private static final int CHUNK_SECONDS = 3;
+    private static final int BUFFER_SIZE   = SAMPLE_RATE * 2 * CHUNK_SECONDS; // 16-bit = 2 bytes
+
+    // ── UI ───────────────────────────────────────────────────────────────────
+    private Button btnStart;
+    private TextView tvStatus;
+    private TextView tvTranslation;
+
+    // ── Services & state ──────────────────────────────────────────────────────
+    private MediaProjectionManager projectionManager;
+    private MediaProjection         mediaProjection;
+    private AudioRecord             audioRecord;
+
+    private volatile boolean capturing = false;
+    private ExecutorService captureExecutor;
+    private ExecutorService networkExecutor;
+
+    // ── Overlay ───────────────────────────────────────────────────────────────
+    private WindowManager  windowManager;
+    private TextView       overlayTextView;
+    private WindowManager.LayoutParams overlayParams;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        btnStart     = findViewById(R.id.btn_start);
+        tvStatus     = findViewById(R.id.tv_status);
+        tvTranslation = findViewById(R.id.tv_translation);
+
+        projectionManager = (MediaProjectionManager)
+                getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+
+        captureExecutor = Executors.newSingleThreadExecutor();
+        networkExecutor = Executors.newFixedThreadPool(2); // transcribe + translate in parallel
+
+        btnStart.setOnClickListener(v -> {
+            if (!capturing) startCapture();
+            else            stopCapture();
+        });
+
+        checkWhisperReady();
     }
 
-    private val CHANNEL = "overlay_channel"
-    private var methodChannel: MethodChannel? = null
-
-    // Only ONE pending result at a time — guarded at every write/read site
-    @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
-
-    // ── Download progress broadcast receiver ──────────────────────────────────
-
-    private val downloadReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ModelDownloadService.ACTION_DOWNLOAD_PROGRESS -> {
-                    val pct = intent.getIntExtra(ModelDownloadService.EXTRA_PROGRESS_PCT, 0)
-                    val mb  = intent.getLongExtra(ModelDownloadService.EXTRA_DOWNLOADED_MB, 0L)
-                    val tot = intent.getLongExtra(ModelDownloadService.EXTRA_TOTAL_MB, 0L)
-                    runOnUiThread {
-                        methodChannel?.invokeMethod("onDownloadProgress", mapOf(
-                            "percent"      to pct,
-                            "downloadedMb" to mb,
-                            "totalMb"      to tot
-                        ))
+    // ── Whisper health check ──────────────────────────────────────────────────
+    private void checkWhisperReady() {
+        networkExecutor.submit(() -> {
+            try {
+                URL url = new URL("http://127.0.0.1:8765/ready");
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
+                int code = conn.getResponseCode();
+                runOnUiThread(() -> {
+                    if (code == 200) {
+                        tvStatus.setText("✅ Whisper model ready");
+                    } else {
+                        tvStatus.setText("⚠ Whisper server responded: " + code);
                     }
-                }
-                ModelDownloadService.ACTION_MODEL_READY -> {
-                    runOnUiThread { methodChannel?.invokeMethod("onModelReady", null) }
-                }
-                ModelDownloadService.ACTION_MODEL_ERROR -> {
-                    val msg = intent.getStringExtra(ModelDownloadService.EXTRA_ERROR_MSG) ?: "Unknown error"
-                    runOnUiThread {
-                        methodChannel?.invokeMethod("onModelError", mapOf("message" to msg))
-                    }
-                }
+                });
+                conn.disconnect();
+            } catch (Exception e) {
+                runOnUiThread(() ->
+                        tvStatus.setText("❌ Whisper not reachable — start whisper_server.py"));
             }
+        });
+    }
+
+    // ── Start capture flow ────────────────────────────────────────────────────
+    private void startCapture() {
+        if (!Settings.canDrawOverlays(this)) {
+            Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivityForResult(i, REQ_OVERLAY);
+            return;
+        }
+        Intent intent = projectionManager.createScreenCaptureIntent();
+        startActivityForResult(intent, REQ_MEDIA_PROJECTION);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == REQ_OVERLAY) {
+            if (Settings.canDrawOverlays(this)) startCapture();
+            else Toast.makeText(this, "Overlay permission required", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (requestCode == REQ_MEDIA_PROJECTION && resultCode == RESULT_OK) {
+            mediaProjection = projectionManager.getMediaProjection(resultCode, data);
+            beginAudioCapture();
         }
     }
 
-    // ── Flutter method channel setup ──────────────────────────────────────────
+    // ── Audio capture ─────────────────────────────────────────────────────────
+    private void beginAudioCapture() {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            Toast.makeText(this, "Internal audio requires Android 10+", Toast.LENGTH_LONG).show();
+            return;
+        }
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
-        instance = this
+        AudioPlaybackCaptureConfiguration config =
+                new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                        .build();
 
-        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-        methodChannel?.setMethodCallHandler { call, result ->
-            when (call.method) {
+        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT);
+        int bufSize = Math.max(minBuf * 2, BUFFER_SIZE);
 
-                "hasOverlayPermission" ->
-                    result.success(Settings.canDrawOverlays(this))
+        audioRecord = new AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(config)
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AUDIO_FORMAT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(CHANNEL_CONFIG)
+                        .build())
+                .setBufferSizeInBytes(bufSize)
+                .build();
 
-                "requestOverlayPermission" -> {
-                    if (!Settings.canDrawOverlays(this)) {
-                        startActivity(Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        ))
-                        result.success(false)
-                    } else {
-                        result.success(true)
-                    }
-                }
+        if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+            tvStatus.setText("❌ AudioRecord init failed");
+            return;
+        }
 
-                "hasAudioPermission" ->
-                    result.success(
-                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                            == PackageManager.PERMISSION_GRANTED
-                    )
+        capturing = true;
+        btnStart.setText("STOP");
+        tvStatus.setText("🎙 Capturing…");
+        createOverlay();
+        audioRecord.startRecording();
 
-                "requestAudioPermission" ->
-                    requestAudioThenProjection(result)
+        captureExecutor.submit(this::captureLoop);
+    }
 
-                // No-op stubs (accessibility not needed for internal-audio capture)
-                "checkAccessibilityEnabled" -> result.success(true)
-                "openAccessibilitySettings" -> result.success(true)
+    /**
+     * captureLoop — runs on captureExecutor thread.
+     * Reads 3-second PCM chunks and hands each to networkExecutor for
+     * Whisper transcription + LibreTranslate → Hindi.
+     */
+    private void captureLoop() {
+        byte[] chunk = new byte[BUFFER_SIZE];
+        ByteArrayOutputStream pcmAccumulator = new ByteArrayOutputStream();
+        int bytesPerChunk = BUFFER_SIZE;  // 3 s worth
 
-                "isModelReady" ->
-                    result.success(ModelDownloadService.isModelReady(this))
+        while (capturing) {
+            int read = audioRecord.read(chunk, 0, chunk.length);
+            if (read <= 0) continue;
 
-                "getModelStatus" ->
-                    result.success(
-                        if (ModelDownloadService.isModelReady(this)) "ready" else "not_downloaded"
-                    )
+            pcmAccumulator.write(chunk, 0, read);
 
-                "startModelDownload" -> {
-                    val force = call.argument<Boolean>("forceRedownload") ?: false
-                    if (force || !ModelDownloadService.isModelReady(this)) {
-                        val i = Intent(this, ModelDownloadService::class.java)
-                        startForegroundServiceCompat(i)
-                        result.success(true)
-                    } else {
-                        result.success(false) // already ready
-                    }
-                }
+            if (pcmAccumulator.size() >= bytesPerChunk) {
+                final byte[] pcm = pcmAccumulator.toByteArray();
+                pcmAccumulator.reset();
 
-                "startOverlay" -> {
-                    val i = Intent(this, OverlayService::class.java)
-                    startForegroundServiceCompat(i)
-                    result.success(true)
-                }
-
-                "stopOverlay" -> {
-                    stopService(Intent(this, OverlayService::class.java))
-                    result.success(true)
-                }
-
-                // "startSpeechCapture" triggers audio permission → media projection
-                "startSpeechCapture" ->
-                    requestAudioThenProjection(result)
-
-                "stopSpeechCapture" -> {
-                    stopService(Intent(this, SpeechCaptureService::class.java))
-                    result.success(true)
-                }
-
-                "isSpeechCaptureRunning" ->
-                    result.success(SpeechCaptureService.isRunning)
-
-                "setTargetLanguage" -> {
-                    val lang = call.argument<String>("language") ?: "english"
-                    SpeechCaptureService.targetLanguage = lang
-                    result.success(true)
-                }
-
-                "getLatestTranslation" ->
-                    result.success(mapOf(
-                        "original" to SpeechCaptureService.latestOriginal,
-                        "english"  to SpeechCaptureService.latestEnglish,
-                        "hindi"    to SpeechCaptureService.latestHindi
-                    ))
-
-                else -> result.notImplemented()
+                networkExecutor.submit(() -> processChunk(pcm));
             }
+        }
+
+        // Flush remainder
+        byte[] remaining = pcmAccumulator.toByteArray();
+        if (remaining.length > SAMPLE_RATE) { // at least 0.5 s
+            networkExecutor.submit(() -> processChunk(remaining));
+        }
+    }
+
+    /**
+     * processChunk — runs on networkExecutor thread.
+     * 1. Send PCM → Whisper → text + detected language
+     * 2. If not Hindi/English, send to LibreTranslate → Hindi
+     * 3. Update overlay
+     */
+    private void processChunk(byte[] pcmBytes) {
+        try {
+            // Step 1: wrap PCM in WAV and send to Whisper
+            byte[] wavBytes = pcmToWav(pcmBytes, SAMPLE_RATE, 1, 16);
+            String whisperJson = httpPost(WHISPER_URL, wavBytes, "audio/wav");
+            if (whisperJson == null) return;
+
+            JSONObject whisperResult = new JSONObject(whisperJson);
+            String text     = whisperResult.optString("text", "").trim();
+            String srcLang  = whisperResult.optString("language", "en");
+
+            if (text.isEmpty()) return;
+
+            // Step 2: Translate to Hindi via LibreTranslate
+            String hindiText = translateToHindi(text, srcLang);
+            String displayText = (hindiText != null && !hindiText.isEmpty()) ? hindiText : text;
+
+            // Step 3: Update overlay on main thread
+            final String finalText = displayText;
+            runOnUiThread(() -> {
+                updateOverlay(finalText);
+                tvTranslation.setText(finalText);
+            });
+
+        } catch (Exception e) {
+            // Non-fatal — skip this chunk
+            System.err.println("[CaptionLens] processChunk error: " + e.getMessage());
+        }
+    }
+
+    private String translateToHindi(String text, String srcLang) {
+        // Skip translation if already Hindi (hi) or if language detection uncertain
+        if ("hi".equals(srcLang)) return text;
+
+        try {
+            JSONObject body = new JSONObject();
+            body.put("q",      text);
+            body.put("source", srcLang.isEmpty() ? "auto" : srcLang);
+            body.put("target", "hi");
+            body.put("format", "text");
+
+            byte[] bodyBytes = body.toString().getBytes("UTF-8");
+            String response  = httpPostJson(LIBRE_URL, bodyBytes);
+            if (response == null) return null;
+
+            JSONObject result = new JSONObject(response);
+            return result.optString("translatedText", null);
+
+        } catch (Exception e) {
+            System.err.println("[CaptionLens] translate error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ── HTTP helpers ──────────────────────────────────────────────────────────
+    private String httpPost(String urlStr, byte[] body, String contentType) {
+        try {
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(15000); // Whisper may take up to 10s on slow CPU
+            conn.setRequestProperty("Content-Type", contentType);
+            conn.setRequestProperty("Content-Length", String.valueOf(body.length));
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body);
+            }
+
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            if (is == null) return null;
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) != -1) baos.write(buf, 0, n);
+            conn.disconnect();
+            return baos.toString("UTF-8");
+
+        } catch (Exception e) {
+            System.err.println("[CaptionLens] httpPost error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private String httpPostJson(String urlStr, byte[] body) {
+        return httpPost(urlStr, body, "application/json; charset=UTF-8");
+    }
+
+    // ── WAV header builder ────────────────────────────────────────────────────
+    private static byte[] pcmToWav(byte[] pcm, int sampleRate, int channels, int bitsPerSample) {
+        int dataLen   = pcm.length;
+        int totalLen  = dataLen + 44 - 8;
+        int byteRate  = sampleRate * channels * bitsPerSample / 8;
+        int blockAlign = channels * bitsPerSample / 8;
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream(dataLen + 44);
+        DataOutputStream dos = new DataOutputStream(out);
+        try {
+            dos.writeBytes("RIFF");
+            writeLe32(dos, totalLen);
+            dos.writeBytes("WAVEfmt ");
+            writeLe32(dos, 16);
+            writeLe16(dos, 1);             // PCM
+            writeLe16(dos, channels);
+            writeLe32(dos, sampleRate);
+            writeLe32(dos, byteRate);
+            writeLe16(dos, blockAlign);
+            writeLe16(dos, bitsPerSample);
+            dos.writeBytes("data");
+            writeLe32(dos, dataLen);
+            dos.write(pcm);
+        } catch (IOException ignored) {}
+        return out.toByteArray();
+    }
+
+    private static void writeLe32(DataOutputStream d, int v) throws IOException {
+        d.write(v & 0xFF); d.write((v >> 8) & 0xFF);
+        d.write((v >> 16) & 0xFF); d.write((v >> 24) & 0xFF);
+    }
+    private static void writeLe16(DataOutputStream d, int v) throws IOException {
+        d.write(v & 0xFF); d.write((v >> 8) & 0xFF);
+    }
+
+    // ── Stop capture ──────────────────────────────────────────────────────────
+    private void stopCapture() {
+        capturing = false;
+        if (audioRecord != null) {
+            try { audioRecord.stop(); } catch (Exception ignored) {}
+            try { audioRecord.release(); } catch (Exception ignored) {}
+            audioRecord = null;
+        }
+        if (mediaProjection != null) {
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
+        removeOverlay();
+        btnStart.setText("START — CAPTURE VIDEO AUDIO");
+        tvStatus.setText("Stopped");
+    }
+
+    // ── Overlay ───────────────────────────────────────────────────────────────
+    /**
+     * Creates a FULL-WIDTH, left-aligned, plain-text overlay at the bottom
+     * of the screen. No box, no background frame — transparent bg, white text
+     * with a subtle shadow for readability over any content.
+     */
+    private void createOverlay() {
+        if (overlayTextView != null) return;
+
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        overlayTextView = new TextView(this);
+        overlayTextView.setTextColor(Color.WHITE);
+        overlayTextView.setTextSize(18f);
+        overlayTextView.setShadowLayer(4f, 1f, 1f, Color.BLACK);
+        overlayTextView.setTypeface(null, Typeface.BOLD);
+        overlayTextView.setGravity(Gravity.START | Gravity.BOTTOM);
+        overlayTextView.setPadding(16, 8, 16, 8);
+        overlayTextView.setBackground(null);       // NO box or frame
+        overlayTextView.setMaxLines(3);
+        overlayTextView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        overlayTextView.setText(""); // start empty
+
+        int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+
+        overlayParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,   // FULL WIDTH
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+        );
+        // Position at bottom-left
+        overlayParams.gravity = Gravity.BOTTOM | Gravity.START;
+        overlayParams.x = 0;
+        overlayParams.y = 48; // small bottom margin
+
+        try {
+            windowManager.addView(overlayTextView, overlayParams);
+        } catch (Exception e) {
+            tvStatus.setText("❌ Overlay add failed: " + e.getMessage());
+        }
+    }
+
+    private void updateOverlay(String text) {
+        if (overlayTextView == null) return;
+        overlayTextView.setText(text);
+    }
+
+    private void removeOverlay() {
+        if (overlayTextView != null && windowManager != null) {
+            try { windowManager.removeView(overlayTextView); } catch (Exception ignored) {}
+            overlayTextView = null;
         }
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val filter = IntentFilter().apply {
-            addAction(ModelDownloadService.ACTION_DOWNLOAD_PROGRESS)
-            addAction(ModelDownloadService.ACTION_MODEL_READY)
-            addAction(ModelDownloadService.ACTION_MODEL_ERROR)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(downloadReceiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(downloadReceiver, filter)
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        instance = this
-    }
-
-    override fun onDestroy() {
-        try { unregisterReceiver(downloadReceiver) } catch (_: Exception) {}
-        // Deliver failure to any dangling pending result so Flutter doesn't hang
-        pendingProjectionResult?.success(false)
-        pendingProjectionResult = null
-        instance = null
-        super.onDestroy()
-    }
-
-    // ── Permission + projection flow ──────────────────────────────────────────
-
-    /**
-     * Step 1: check overlay permission, then check RECORD_AUDIO.
-     * If audio is already granted → jump straight to media projection.
-     * If not → request it; continuation is in onRequestPermissionsResult().
-     */
-    private fun requestAudioThenProjection(result: MethodChannel.Result) {
-        // Guard: overlay must be granted first
-        if (!Settings.canDrawOverlays(this)) {
-            result.success(false)
-            return
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            requestMediaProjection(result)
-        } else {
-            // Store result — we'll continue in onRequestPermissionsResult()
-            deliverPendingFailure()           // clear any stale pending result first
-            pendingProjectionResult = result
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                REQ_AUDIO_PERMISSION
-            )
-        }
-    }
-
-    /**
-     * Step 2: launch the system screen-capture consent dialog.
-     */
-    private fun requestMediaProjection(result: MethodChannel.Result) {
-        deliverPendingFailure()               // clear any stale pending result first
-        pendingProjectionResult = result
-        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        try {
-            @Suppress("DEPRECATION")
-            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
-        } catch (e: Exception) {
-            Log.e(TAG, "createScreenCaptureIntent failed: ${e.message}")
-            pendingProjectionResult = null
-            result.success(false)
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-
-        if (requestCode == REQ_AUDIO_PERMISSION) {
-            val pending = pendingProjectionResult
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if (pending != null) {
-                    // DO NOT call requestMediaProjection here with the same `pending`:
-                    // requestMediaProjection clears pendingProjectionResult itself.
-                    pendingProjectionResult = null
-                    requestMediaProjection(pending)
-                }
-            } else {
-                pendingProjectionResult = null
-                pending?.success(false)
-            }
-        }
-    }
-
-    @Deprecated("Required for API compatibility below 33")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode == REQ_MEDIA_PROJECTION) {
-            val pending = pendingProjectionResult
-            pendingProjectionResult = null             // consume before any dispatch
-
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                Log.d(TAG, "MediaProjection granted — starting SpeechCaptureService")
-
-                // CRITICAL: On API 34+ the MediaProjection token is ONE-USE.
-                // We must pass the raw result code + data Intent to the service;
-                // the service calls MediaProjectionManager.getMediaProjection() itself.
-                val i = Intent(this, SpeechCaptureService::class.java).apply {
-                    putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
-                    putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
-                }
-                startForegroundServiceCompat(i)
-
-                // Warm up LibreTranslate connection (fire-and-forget)
-                TranslationManager.warmUp()
-
-                pending?.success(true)
-            } else {
-                Log.w(TAG, "MediaProjection denied or cancelled (resultCode=$resultCode)")
-                pending?.success(false)
-            }
-        }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /** Start a foreground service using the correct API for the current OS version. */
-    private fun startForegroundServiceCompat(intent: Intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-    }
-
-    /** If there is a dangling pending result, deliver failure and clear it. */
-    private fun deliverPendingFailure() {
-        val stale = pendingProjectionResult
-        if (stale != null) {
-            pendingProjectionResult = null
-            try { stale.success(false) } catch (_: Exception) {}
-        }
-    }
-
-    /** Called from SpeechCaptureService to push a translation to Flutter UI. */
-    fun onTranslation(original: String, english: String, hindi: String) {
-        runOnUiThread {
-            methodChannel?.invokeMethod("onTranslation", mapOf(
-                "original" to original,
-                "english"  to english,
-                "hindi"    to hindi
-            ))
-        }
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        stopCapture();
+        captureExecutor.shutdownNow();
+        networkExecutor.shutdownNow();
     }
 }
